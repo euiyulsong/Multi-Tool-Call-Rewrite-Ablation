@@ -1,79 +1,113 @@
-# Multi-tool router → tool-specific query rewriting
+# Multi-tool Query Rewriting 실험 결과
 
-모델: `gpt-6-luna`, reasoning effort `none`. Python 3.10+.
+## 실험 목적과 조건
 
-## 비교 설계
+선택된 tool idx 리스트를 받은 뒤 tool별 standalone query를 만드는 세 방식을 비교했다. 모델은 `gpt-6-luna`, reasoning effort는 `none`, 기본 concurrency는 4다.
 
-| Variant | 호출 수 | 입력 tool 정보 | 출력 |
-|---|---:|---|---|
-| joint | 1 | router가 선택한 전체 tool schema와 idx | 모든 idx의 query |
-| per_tool_with_list | K, 병렬 | 현재 target schema + 선택된 전체 schema/idx | 현재 idx의 query |
-| per_tool_local | K, 병렬 | 현재 target schema/idx만 | 현재 idx의 query |
+| Variant | 리라이팅 호출 | 제공되는 tool 정보 |
+|---|---|---|
+| `joint` | 전체 tool을 한 번에 처리 | 선택된 전체 schema/idx |
+| `per_tool_local` | tool별 병렬 호출 | 현재 target schema/idx |
+| `per_tool_with_list` | tool별 병렬 호출 | 현재 target + 선택된 전체 schema/idx |
 
-세 조건 모두 동일한 전체 대화와 마지막 질문을 받습니다. local 조건에서 **다른 선택 tool 목록만 제거**합니다. Router는 query나 arguments를 생성하지 않고 `[0, 2]` 같은 idx 리스트만 출력합니다. idx는 샘플 내부 0-based 번호입니다. idx 리스트의 순서는 실행 순서를 뜻하지 않습니다.
+모든 variant는 같은 대화와 같은 router 결과를 받는다. 데이터는 공개 Hermes Function Calling의 multi-tool 샘플이다. `single`은 원본 요청, `multi_derived`는 요청을 이전 대화에 두고 마지막 질문에서 재참조하도록 만든 파생 조건이다. 실제 다중 사용자 질문, 조건 변경, 충돌 해결을 포함한 native multi-turn 평가는 아니다.
 
-joint 출력도 tool별 query입니다. 하나의 통합 query를 여러 tool에 복사하는 조건이 아닙니다. with_list는 idx만이 아니라 해당 schema도 제공하므로 협업 task 분해의 정보 효과를 봅니다. 실제 즉시 dispatch의 스트리밍 지연은 측정하지 않습니다.
+`oracle`은 정답 idx로 리라이팅을 비교하고, `predicted`는 LLM router가 생성한 idx를 재사용해 전체 파이프라인을 비교한다. 제공된 첫 배열은 oracle, 두 번째 배열은 predicted로 해석했다.
 
-## 데이터
+## 주요 지표
 
-공개 NousResearch/hermes-function-calling-v1 (dataset card: Apache-2.0)의 `func-calling-singleturn.json` 사용.
-https://huggingface.co/datasets/NousResearch/hermes-function-calling-v1
+- **Tool argument exact**: 선택된 tool별 query만 보고 공통 decoder가 복원한 arguments가 gold와 strict 일치하는 비율. tool 기준 micro 평균이다.
+- **All-gold exact**: tool idx set과 모든 gold tool의 arguments가 동시에 일치한 샘플 비율.
+- **Valid**: rewrite 출력 JSON, idx coverage, 비어 있지 않은 한 줄 query 형식의 유효성. 의미적 정확성과 별개다.
+- **Latency**: rewrite 단계의 병렬 critical-path 추정 시간. router/decoder 시간을 포함하지 않는다.
+- **Tokens**: 한 샘플의 rewrite 호출 전체에 걸친 입력/출력 토큰 합계.
 
-Hugging Face 토큰·로그인 없이 urllib 공개 HTTP로 다운로드합니다. `huggingface_hub` 의존성을 제거했습니다. 원본 tool schema와 assistant의 `<tool_call>` JSON을 정답으로 사용합니다. 서로 다른 gold tool이 2개 이상인 샘플만 포함하고 동일 tool의 반복 호출은 유지합니다. 파싱 불가능한 샘플은 준비 단계에서 제외하고 수를 기록합니다. 다운로드 SHA와 원본 파일 hash, 샘플 hash를 기록합니다.
+## Oracle 결과: 각 조건 100개, 완료
 
-이 파일에는 필터 후 572개 multi-tool 원본 샘플이 확인됐습니다. 현재 질문 이후 assistant 정답은 모델 입력에서 제외합니다. `func-calling.json`도 확인했지만 후속 tool response가 있는 형태이며, 검사된 tool-call 샘플에 복수 user turn은 없었습니다. 따라서 멀티턴은 아래처럼 명시적인 파생 조건을 유지합니다.
+### 품질
 
-- `single`: 원본 요청 그대로.
-- `multi_derived`: 원본 요청 → assistant의 미실행 확인 → 마지막 user가 이전 요청 실행을 참조. 두 조건은 같은 source_id로 짝지어집니다.
+| 조건 | Variant | n | Router exact | Valid | Tool argument exact | All-gold exact |
+|---|---|---:|---:|---:|---:|---:|
+| Single | joint | 100 | 100% | 97% | 70.40% | 57% |
+| Single | per_tool_local | 100 | 100% | 100% | 71.48% | 57% |
+| Single | per_tool_with_list | 100 | 100% | 99% | 72.56% | 58% |
+| Multi derived | joint | 100 | 100% | 99% | 70.04% | 53% |
+| Multi derived | per_tool_local | 100 | 100% | 100% | 71.12% | 56% |
+| Multi derived | per_tool_with_list | 100 | 100% | 99% | 70.76% | 54% |
 
-**기본 멀티턴은 파생 reference-back 실험입니다. 실제 BFCL 멀티턴이나 수정·충돌·tool-result 의존성을 검증한 결과로 해석할 수 없습니다.** 원본 single query가 history에 그대로 존재하므로 난도가 낮습니다. 원본 멀티턴이 필요하면 아래 정규화 JSONL을 입력하세요. 이 패키지는 BFCL simulator/trajectory adapter를 포함하지 않습니다.
+### 지연과 토큰
 
-```json
-{"id":"native:1:turn2","source_id":"native:1","split":"multi_native","messages":[{"role":"user","content":"Search Seoul weather and Busan hotels."},{"role":"assistant","content":"Which hotel date?"},{"role":"user","content":"2026-10-23. Keep the other request."}],"tools":[{"idx":0,"name":"weather","description":"Weather lookup","parameters":{"type":"object","properties":{"city":{"type":"string"}}}},{"idx":1,"name":"hotels","description":"Hotel lookup","parameters":{"type":"object","properties":{"city":{"type":"string"},"date":{"type":"string"}}}}],"gold_idx":[0,1],"gold_arguments":{"0":[{"city":"Seoul"}],"1":[{"city":"Busan","date":"2026-10-23"}]}}
-```
+| 조건 | Variant | 평균 지연(s) | p95(s) | 평균 입력 토큰 | 평균 출력 토큰 |
+|---|---|---:|---:|---:|---:|
+| Single | joint | 3.328 | 11.510 | 919.02 | 168.31 |
+| Single | per_tool_local | 2.765 | 8.500 | 1,588.47 | 185.85 |
+| Single | per_tool_with_list | 3.566 | 5.222 | 2,639.80 | 140.74 |
+| Multi derived | joint | 3.511 | 6.382 | 878.40 | 176.87 |
+| Multi derived | per_tool_local | 2.541 | 5.231 | 1,747.05 | 156.92 |
+| Multi derived | per_tool_with_list | 2.401 | 5.083 | 2,758.79 | 147.09 |
 
-native 입력에서 messages는 현재 마지막 질문까지만 포함하며, 현재 turn gold와 tool schema를 사람이 검증해야 합니다. 미래 turn/정답 trajectory를 history에 넣지 마세요. 실제 tool response를 포함하려면 messages에 role/content 객체로 기록하면 됩니다. 본 프로그램은 대화를 JSON 데이터로 전달합니다.
+### 해석
 
-## 실행
+**joint는 입력 토큰 효율이 가장 좋았다.** local 대비 single 입력 토큰은 약 42.1%, multi derived는 약 49.7% 적었다. with_list 대비는 각각 약 65.2%, 68.2% 적었다. 출력 토큰까지 포함한 실제 비용은 모델 가격과 caching에 따라 달라진다.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export OPENAI_API_KEY='your-key'
-python3 benchmark.py prepare --n 100 --seed 42
-# 리라이팅 자체 비교: 같은 정확한 gold idx를 주고 비교
-python3 benchmark.py run --route oracle --out results/oracle --concurrency 4
-# 실제 router idx를 한 번 생성해 세 variant가 공통 재사용
-python3 benchmark.py run --route predicted --out results/predicted --concurrency 4
-# 반복 안정성
-python3 benchmark.py run --route oracle --out results/oracle --concurrency 4 --repeats 3
-# native JSONL
-python3 benchmark.py run --data data/native.jsonl --out results/native
-```
+**per_tool_local은 관측된 품질·형식 안정성·평균 지연의 균형이 좋았다.** single all-gold exact는 joint와 같은 57%, multi derived는 3%p 높은 56%였다. 두 조건에서 valid는 100%였다. 평균 지연은 joint 대비 single 약 16.9%, multi derived 약 27.6% 낮았다.
 
-먼저 `--n 5`와 별도 --data/--out으로 smoke run 권장. 기본 n=100은 source 100개 × 두 turn 조건 × 3 variants = 600 rewrite 평가 단위입니다. K개 local rewrite 호출과 각 query decoder 호출을 추가합니다. prepare는 모델 API를 호출하지 않습니다.
+**전체 선택 목록을 추가한 효과는 일관되지 않았다.** with_list는 single에서 local 대비 all-gold exact +1%p, tool argument exact +1.08%p였지만, multi derived에서는 각각 −2%p, −0.36%p였다. 입력 토큰은 local 대비 single 약 66.2%, multi derived 약 57.9% 늘었다. 이번 결과에서는 추가 목록의 품질 이득이 비용 증가를 뚜렷하게 설명하지 못했다.
 
-Responses API를 사용합니다. `OPENAI_BASE_URL`을 설정하면 SDK의 호환 endpoint를 사용할 수 있습니다. 모델 이름을 자동으로 바꾸지 않습니다.
+single all-gold exact는 57–58%, multi derived는 53–56%였다. 같은 source에서 만들어진 paired 조건이므로 이 차이를 실제 멀티턴 난도 증가의 일반적인 효과로 해석할 수 없다. 1–3%p 차이의 통계적 유의성도 현재 집계만으로 판단할 수 없다.
 
-## 평가와 해석
+## Predicted 결과: 진행 중인 중간 집계
 
-1. `router_exact`: gold idx set exact match. oracle에서는 1.
-2. `rewrite_valid_rate`: idx 누락/중복/추가, 빈 query, 줄바꿈, JSON 오류 확인. 실패를 None query로 처리하지 않습니다.
-3. `selected_tool_argument_exact`: tool schema + 해당 query만 받은 공통 decoder가 복원한 호출 arguments와 gold를 strict multiset 비교. 잘못 선택된 tool은 실패.
-4. `all_gold_arguments_exact`: router set과 모든 gold tool의 arguments가 동시에 정답. 가장 중요한 end-to-end 지표.
-5. rewrite 단계 입력/출력 토큰 합계와 병렬 critical-path 지연 평균/p95. decoder/router 토큰은 rewrite 토큰에 포함하지 않습니다. 상세 응답 usage와 오류를 보존합니다.
+single은 variant별 n=32–33, multi derived는 n=32다. 완주 결과가 아니며, single에서는 마지막 샘플의 일부 variant만 완료된 상태로 보인다. 같은 샘플 집합으로 완료한 뒤 최종 비교해야 한다.
 
-리라이팅 문장 자체는 gold가 없으므로 **argument exact는 downstream proxy**입니다. decoder 오류와 표현 차이에 민감하며 의미적 동등성을 완전히 평가하지 못합니다. strict JSON 비교는 타입/값 차이도 실패합니다. dependency가 실행 결과를 필요로 하면 UNRESOLVED를 사용하므로 원래 concrete gold와는 실패할 수 있습니다. 이 경우 실제 execution/replanning 평가를 별도로 구성해야 합니다.
+### 품질
 
-개별 호출은 최대 3번 시도. 재시도 비용을 토큰에 포함하며 실패는 분모에서 제거하지 않습니다. 성공한 API 응답은 hash cache, 샘플 결과는 JSONL로 즉시 저장합니다. 설정/데이터가 바뀌면 새 out을 사용해야 합니다. resumes는 원래 저장된 호출 시간을 사용합니다. 각 호출 시간은 semaphore 대기와 재시도 시간을 포함하며, per-tool max로 critical-path를 추정합니다. provider load·cache·공유 concurrency의 영향을 받으므로 엄밀한 서비스 SLA 수치는 아닙니다. variant 순서를 샘플마다 섞어 순서 영향을 줄입니다.
+| 조건 | Variant | n | Router exact | Valid | Tool argument exact | All-gold exact |
+|---|---|---:|---:|---:|---:|---:|
+| Single | joint | 33 | 75.76% | 100% | 73.81% | 42.42% |
+| Single | per_tool_local | 33 | 75.76% | 100% | 77.38% | 45.45% |
+| Single | per_tool_with_list | 32 | 75.00% | 100% | 75.31% | 43.75% |
+| Multi derived | joint | 32 | 78.13% | 100% | 71.43% | 43.75% |
+| Multi derived | per_tool_local | 32 | 78.13% | 100% | 71.43% | 40.63% |
+| Multi derived | per_tool_with_list | 32 | 78.13% | 100% | 73.81% | 43.75% |
 
-`summary.json`은 split/variant별 집계, `results.jsonl`은 query/decoder/원시 오류. 반복 집계는 동일 source의 반복 관측이므로 독립 표본 수 증가로 해석하지 마세요. 품질 차이는 source_id 단위 paired 비교로 확인하고 실패 query를 수동 검토하세요. 통계 검정/CI 자동 산출은 포함하지 않습니다.
+### 지연과 토큰
 
-예상 가설(측정 결과 아님): joint는 토큰 효율, local은 격리/즉시 dispatch, with_list는 중복·task 분배 조정에 장점이 있을 수 있습니다. 품질 결과가 비슷하면 토큰과 병렬 지연을 보고 선택합니다.
+| 조건 | Variant | 평균 지연(s) | p95(s) | 평균 입력 토큰 | 평균 출력 토큰 |
+|---|---|---:|---:|---:|---:|
+| Single | joint | 2.592 | 8.596 | 746.70 | 128.91 |
+| Single | per_tool_local | 2.986 | 7.948 | 1,423.36 | 141.33 |
+| Single | per_tool_with_list | 2.239 | 4.247 | 2,287.53 | 117.94 |
+| Multi derived | joint | 2.420 | 4.613 | 782.59 | 106.44 |
+| Multi derived | per_tool_local | 2.348 | 5.126 | 1,591.50 | 144.22 |
+| Multi derived | per_tool_with_list | 2.411 | 7.055 | 2,483.22 | 128.25 |
 
-## 검증 상태
+### 해석
 
-토큰 없는 실제 공개 다운로드, 100개 원본 → 200개 평가 행 생성, 문법 및 API-free mock 흐름을 검증했습니다. 유료 모델 benchmark 결과는 포함하지 않습니다.
+router exact는 약 75–78%로, router idx set이 gold와 다른 샘플은 all-gold exact에서 실패한다. 다만 exact만으로 누락과 과잉 선택 중 무엇이 주요 원인인지 구분할 수 없다.
 
-압축에 `data/samples.jsonl` 200행을 미리 포함했습니다. 다운로드 없이 `run`부터 실행할 수 있습니다. 다시 샘플링할 때만 `prepare`를 실행하세요. 다운로드 실패 시 `--raw-file`로 원본 JSON을 지정할 수 있습니다.
+predicted의 tool argument exact가 일부 oracle 수치보다 높아도 전체 성능 향상을 뜻하지 않는다. 현재 평가 샘플 수가 다르고, 분모가 선택된 tool이므로 누락된 gold tool은 해당 tool별 지표에서 직접 실패로 계산되지 않는다. 누락은 all-gold exact에 반영된다.
+
+single에서는 local의 all-gold exact가 가장 높고, multi derived에서는 joint/with_list가 높았다. 적은 중간 표본에서의 결과로 최종 순위를 정하기 어렵다. Oracle와의 차이를 router의 순수 손실로 계산하려면 동일 source_id 집합으로 재집계해야 한다.
+
+## 평가의 한계
+
+**Strict exact는 자유 텍스트의 표면 차이에도 실패한다.** 확인된 첫 샘플에서는 `notes`의 문장 끝 마침표 하나 때문에 tool 0이 실패했고, 나머지 tool 1·2는 정확했다. 전체 샘플은 False였다. 따라서 현재 exact 수치는 의미적으로 정확한 리라이팅까지 실패로 포함할 수 있다.
+
+strict 지표를 유지하면서 자유 텍스트 필드에만 제한적인 공백·문장 끝 마침표 정규화를 적용한 보조 지표를 추가하는 것이 적절하다. ID·날짜·수치·enum·코드 등의 값은 strict 비교를 유지해야 한다. 정규화 점수도 완전한 semantic accuracy는 아니다. 저장된 decoder_details로 API 재호출 없이 재채점할 수 있지만, 현재 제공된 summary는 재채점 이전 수치다.
+
+arguments 복원에는 별도의 LLM decoder를 사용하므로 이 지표는 **리라이팅 + decoder의 downstream proxy**다. 실패가 리라이팅의 정보 손실인지 decoder의 복원 오류인지 집계만으로 분리할 수 없다.
+
+Latency는 호출별 semaphore 대기와 재시도를 포함한 시간의 max를 사용하는 추정값이다. provider load, concurrency, 재시도와 캐시의 영향을 받는다. 특히 작은 표본의 p95 차이는 반복 측정으로 확인해야 하며, 서비스 전체 latency나 SLA로 해석할 수 없다.
+
+## 현재 선택과 후속 검증
+
+| 우선순위 | 현재 후보 | 근거 |
+|---|---|---|
+| 입력 토큰 절감 | joint | Oracle 두 조건에서 가장 적은 입력 토큰 |
+| 형식 안정성과 평균 지연 | per_tool_local | Oracle valid 100%, joint보다 낮은 평균 지연 |
+| 전체 목록을 통한 task 분배 | per_tool_with_list | 품질 이득이 조건별로 달라 추가 검증 필요 |
+
+현재 관측치에서는 **joint와 per_tool_local을 주요 후보로 유지**할 수 있다. with_list의 추가 토큰을 정당화하는 일관된 품질 개선은 확인되지 않았다.
+
+후속 검증은 predicted 완주, 동일 source_id로 paired 비교, 자유 텍스트 정규화 재채점, 실패 샘플의 정보 손실/decoder 오류 분류 순서로 진행한다. 실제 multi-user 대화에서는 조건 수정·참조 해결·이전 tool 결과 의존성을 포함한 별도 평가가 필요하다.
