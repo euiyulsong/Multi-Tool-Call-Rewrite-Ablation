@@ -1,0 +1,12 @@
+{
+  "dataset": "NousResearch/hermes-function-calling-v1",
+  "revision": "dae3e1d28cfbcf4b915c04ea1e072030529b4bda",
+  "source_sha256": "fb2df9fe3f295dfd65b223c2dbf04d6b90006357d737f8f8927749f0bea09527",
+  "seed": 42,
+  "source_samples": 100,
+  "rows": 200,
+  "available": 572,
+  "skipped_rows": 793,
+  "sha256": "c120ab0c4649b2f4ca63abeec4bdd9a67953f3bd069538d3cda5a17ff9b1b0b4",
+  "multi_turn": "derived reference-back, not native multi-user conversation"
+}
